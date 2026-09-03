@@ -225,9 +225,9 @@ class IONEXReader:
                     )
 
                 raw = np.asarray(values[:nlon], dtype=np.int32)
-                tec = raw.astype(np.float32)
+                tec = raw.astype(np.float64)
                 missing = raw == MISSING_VALUE
-                tec *= np.float32(10.0 ** exponent)
+                tec *= 10.0 ** exponent
                 tec[missing] = np.nan
 
                 lon = cls._grid_values(lon1, lon2, dlon)
@@ -303,12 +303,12 @@ class IONEXReader:
         tec = np.full(
             (len(maps), lat.size, lon.size),
             np.nan,
-            dtype=np.float32,
+            dtype=np.float64,
         )
         height = np.full(
             (len(maps), lat.size),
             np.nan,
-            dtype=np.float32,
+            dtype=np.float64,
         )
         epochs = []
 
