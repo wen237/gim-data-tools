@@ -18,8 +18,9 @@ The tools were developed to support reproducible ionospheric total electron cont
 - Validation of downloaded files before they are saved.
 - Parse IONEX TEC maps without assuming a fixed number of maps or fixed grid dimensions.
 - Apply the IONEX `EXPONENT` scaling factor automatically.
-- Convert missing TEC values (`9999`) to `NaN`.
+- Convert raw IONEX TEC values of `9999` and `0` to `NaN` before exponent scaling.
 - Export TEC maps and coordinates to compressed NumPy (`.npz`) files.
+- Convert a directory of IONEX files in a non-recursive batch, skipping existing outputs and rejecting ambiguous output filenames.
 
 ## Repository Structure
 
@@ -27,7 +28,9 @@ The tools were developed to support reproducible ionospheric total electron cont
 gim-data-tools/
 ├── cddis_gim_ftps_downloader.py
 ├── ionex_reader.py
-├── requirements.txt
+├── requirement.txt
+├── tests/
+│   └── test_ionex_batch.py
 ├── README.md
 ├── LICENSE
 └── .gitignore
@@ -35,7 +38,8 @@ gim-data-tools/
 
 - `cddis_gim_ftps_downloader.py` — downloads GIM/IONEX products from NASA CDDIS.
 - `ionex_reader.py` — reads IONEX TEC maps and converts them to NumPy `.npz` files.
-- `requirements.txt` — Python dependencies required by the tools.
+- `requirement.txt` — Python dependencies required by the tools.
+- `tests/test_ionex_batch.py` — regression tests for batch conversion.
 
 ## Requirements
 
@@ -61,7 +65,7 @@ cd gim-data-tools
 Install the required Python packages:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r requirement.txt
 ```
 
 ## Data Source
@@ -175,6 +179,18 @@ The reader supports:
 
 Historical `.Z` files are decompressed using `unlzw3`.
 
+### 3. Batch Convert IONEX Files
+
+To convert all supported IONEX files directly inside one input directory:
+
+```powershell
+python ionex_reader.py --input-dir "./gim_data" --output-dir "./processed"
+```
+
+Batch conversion is **non-recursive**: files in nested subdirectories are not scanned. Existing output files are skipped rather than overwritten. If multiple input files would produce the same output filename (case-insensitively), those inputs are reported as failures instead of being converted ambiguously. The command returns a nonzero exit status when one or more conversions fail.
+
+The batch converter writes each completed archive via a temporary file and publishes it without overwriting an output that already exists. Input and output directories must differ.
+
 ## Output Data Structure
 
 The generated `.npz` archive contains:
@@ -189,9 +205,13 @@ The generated `.npz` archive contains:
 | `exponent` | IONEX exponent read from the source file |
 | `source_file` | Original IONEX filename |
 
-TEC values are scaled according to the `EXPONENT` field in the IONEX file.
+### TEC Scaling and Missing-Value Handling
 
-The IONEX missing-value indicator `9999` is converted to `NaN`.
+TEC is stored as `float64` in **TECU**, after applying the IONEX `EXPONENT` field. Raw IONEX integer values of `9999` (missing-value sentinel) **and `0`** are treated as invalid by this reader and converted to `NaN` **before scaling**. Consequently, zero-valued raw cells are not retained as valid zero TEC observations.
+
+For negative exponents, scaling uses division by the corresponding positive power of ten (for example, `raw / 10.0` for `EXPONENT = -1`), preserving exact numerical consistency with the validated legacy CODE GIM processing convention. Other exponent values use multiplication by the specified power of ten.
+
+The saved `tec` array is already in TECU; **do not apply the exponent or divide by ten again** when loading the `.npz` file.
 
 The resulting archive can be loaded with NumPy:
 
@@ -259,6 +279,27 @@ Then convert a downloaded product:
 ```bash
 python ionex_reader.py ./gim_data/COD0OPSFIN_20260010000_01D_01H_GIM.INX.gz
 ```
+
+## Testing and Validation
+
+Run the repository's tests from the project root:
+
+```powershell
+python -m pytest -q
+```
+
+If pytest is not installed in the active environment, install it separately (for example, `python -m pip install pytest`). During the GIM-3B repository review, **23 tests passed** in the contributor's local environment. Test results should be rerun after subsequent code changes.
+
+### Legacy/Modern CODE GIM Cross-Validation
+
+A separate scientific-framework validation compared legacy CODE GIM `.npz` inputs with `.npz` files produced by this reader for **2022-01-01 through 2022-01-16** (16 UTC days). In that specified dataset and configuration, the validation found:
+
+- Exact TEC and `NaN` mask equality on the physical **71 × 73** grid across **384 hourly epochs**, using the first 24 maps of each day.
+- Identical Framework D spatial anomaly counts and ratios for `reference_days=15`, `window_steps=24`, and `k=3.0`.
+- Identical Framework A temporal input and anomaly results at **30°N, 70°E** for the specified 24-hour analysis window.
+- Identical Framework B+C historical daily TEC and hourly metadata at the same grid point, with no interpolation.
+
+These results establish **Legacy/Modern consistency for the specified inputs and analysis windows**. They do **not** constitute full historical earthquake-case reproduction or validation of multi-event Z-tests and K-means clustering. The integration validation scripts and report belong to the related scientific-framework repository rather than this data-access repository.
 
 ## Citation
 
