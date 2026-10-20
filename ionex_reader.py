@@ -225,9 +225,16 @@ class IONEXReader:
                     )
 
                 raw = np.asarray(values[:nlon], dtype=np.int32)
+                # IONEX missing sentinel and zero TEC are invalid.
+                # Identify both in raw units before applying EXPONENT.
+                missing = (raw == MISSING_VALUE) | (raw == 0)
                 tec = raw.astype(np.float64)
-                missing = raw == MISSING_VALUE
-                tec *= 10.0 ** exponent
+
+                if exponent < 0:
+                    tec /= 10.0 ** (-exponent)
+                else:
+                    tec *= 10.0 ** exponent
+
                 tec[missing] = np.nan
 
                 lon = cls._grid_values(lon1, lon2, dlon)
@@ -368,22 +375,142 @@ def convert_file(
     return saved
 
 
+def _is_ionex_candidate(path: Path) -> bool:
+    """Recognize supported IONEX filenames without opening the file."""
+    name = path.name
+    if name.endswith(".Z") or name.lower().endswith(".gz"):
+        name = name.rsplit(".", 1)[0]
+    lower = name.lower()
+    return lower.endswith((".inx", ".i", ".txt")) or bool(
+        re.search(r"\.\d{2}i$", lower)
+    )
+
+
+def _output_name(path: Path) -> str:
+    """Preserve the single-file converter's output naming convention."""
+    base = path
+    if base.suffix.lower() == ".gz" or base.suffix == ".Z":
+        base = base.with_suffix("")
+    if re.search(r"\.\d{2}i$", base.name.lower()):
+        return base.name + ".npz"
+    return base.with_suffix(".npz").name
+
+
+@dataclass(frozen=True)
+class BatchConversionSummary:
+    converted: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
+def convert_directory(
+    input_dir: str | Path,
+    output_dir: str | Path,
+) -> BatchConversionSummary:
+    """Convert supported IONEX files directly under a directory.
+
+    Existing outputs are never overwritten. Filename collisions are
+    reported as failures rather than silently choosing one source.
+    """
+    source = Path(input_dir).expanduser().resolve()
+    target = Path(output_dir).expanduser().resolve()
+
+    if not source.is_dir():
+        raise NotADirectoryError(f"IONEX input directory not found: {source}")
+    if source == target:
+        raise ValueError("Input and output directories must differ.")
+
+    files = sorted(
+        (p for p in source.iterdir() if p.is_file() and _is_ionex_candidate(p)),
+        key=lambda p: p.name,
+    )
+    target.mkdir(parents=True, exist_ok=True)
+
+    output_counts = Counter(_output_name(p).casefold() for p in files)
+    converted = skipped = failed = 0
+
+    for path in files:
+        output_name = _output_name(path)
+        output_path = target / output_name
+
+        if output_counts[output_name.casefold()] > 1:
+            failed += 1
+            LOGGER.error(
+                "Ambiguous output name %s: multiple input files; refusing conversion.",
+                output_name,
+            )
+            continue
+
+        if output_path.exists():
+            skipped += 1
+            LOGGER.info("Skipping existing output: %s", output_path.name)
+            continue
+
+        try:
+            # Parse first, then write to a temporary file in the target directory.
+            # Replace is safe here only after verifying that no final output exists.
+            data = IONEXReader().read(path)
+            import tempfile
+            import os
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{output_path.stem}.", suffix=".npz", dir=target
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+            try:
+                data.save_npz(temp_path)
+                # Hard-link publication fails if another writer created the output.
+                os.link(temp_path, output_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+        except FileExistsError:
+            skipped += 1
+            LOGGER.warning("Output appeared during conversion: %s", output_name)
+        except (IONEXError, OSError, ValueError) as exc:
+            failed += 1
+            LOGGER.error("Failed to convert %s: %s", path.name, exc)
+        else:
+            converted += 1
+            LOGGER.info("Converted %s -> %s", path.name, output_name)
+
+    return BatchConversionSummary(converted, skipped, failed)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert an IONEX GIM file to compressed NumPy .npz."
+        description="Convert one IONEX file or a directory of IONEX files to .npz."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "input",
+        nargs="?",
         type=Path,
-        help="Input IONEX file (.INX, .gz, .Z, .i, or text file).",
+        help="Single IONEX input file (legacy mode).",
+    )
+    mode.add_argument(
+        "--input-dir",
+        type=Path,
+        help="Directory containing IONEX files (non-recursive).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=None,
-        help="Output .npz path. Default: beside the input file.",
+        help="Single-file output .npz path.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Batch output directory.",
+    )
+    args = parser.parse_args()
+    if args.input_dir is not None:
+        if args.output is not None:
+            parser.error("--output cannot be used with --input-dir.")
+        if args.output_dir is None:
+            parser.error("--output-dir is required with --input-dir.")
+    elif args.output_dir is not None:
+        parser.error("--output-dir requires --input-dir.")
+    return args
 
 
 def configure_logging() -> None:
@@ -399,8 +526,15 @@ def main() -> int:
     args = parse_args()
 
     try:
+        if args.input_dir is not None:
+            summary = convert_directory(args.input_dir, args.output_dir)
+            LOGGER.info(
+                "Batch finished: %d converted, %d skipped, %d failed.",
+                summary.converted, summary.skipped, summary.failed,
+            )
+            return 1 if summary.failed else 0
         convert_file(args.input, args.output)
-    except (FileNotFoundError, IONEXError, OSError) as exc:
+    except (FileNotFoundError, NotADirectoryError, IONEXError, OSError, ValueError) as exc:
         LOGGER.error("%s", exc)
         return 1
     except KeyboardInterrupt:
