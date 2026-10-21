@@ -70,7 +70,7 @@ if ($missing.Count -eq 0) {
     return
 }
 
-Write-Host "Year $Year: $($missing.Count) NPZ dates missing before download."
+Write-Host "Year ${Year}: $($missing.Count) NPZ dates missing before download."
 Write-Host "Downloading CODE FIN products for $startDate through $endDate ..."
 & python $downloader --email $Email --start-date $startDate --end-date $endDate --agency COD --type FIN --output-folder $inputDir
 $code = $LASTEXITCODE
